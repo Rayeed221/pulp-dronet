@@ -100,45 +100,68 @@ ORANGE = (0,   140, 255)
 def draw_overlay(
     canvas: np.ndarray,
     steer: float,
+    pitch: float,
     coll: float,
     coll_raw: float,
     depth_mm: float,
     fps: float,
     depth_override: bool,
 ):
-    h, w   = canvas.shape[:2]
-    img_h  = MODEL_INPUT_SIZE * DISP_SCALE
+    h, w    = canvas.shape[:2]
+    img_h   = MODEL_INPUT_SIZE * DISP_SCALE
     gauge_y = img_h
 
     cv2.rectangle(canvas, (0, gauge_y), (w, h), (30, 30, 30), -1)
 
-    # --- Steering arrow ---
-    # Model convention: steer > 0 = turn left, steer < 0 = turn right.
-    # The arrow shows where the drone should GO (away from obstacle), so we
-    # negate steer so the arrowhead points in the correct avoidance direction.
+    # -----------------------------------------------------------------------
+    # 2-D avoidance arrow drawn on the camera image
+    # steer : yaw from model  (+1 = left obstacle → go right)
+    # pitch : vertical bias from depth  (+1 = top obstacle → go down)
+    # Arrow origin = image centre; tip shows avoidance direction.
+    # -----------------------------------------------------------------------
     cx  = w // 2
-    cy  = img_h - 20
-    end_x = int(cx + steer * 90)   # negated: positive steer → arrow points right (away from left obstacle)
-    arrow_col = YELLOW if abs(steer) < 0.15 else (GREEN if steer > 0 else BLUE)
-    cv2.arrowedLine(canvas, (cx, cy), (end_x, cy), arrow_col, 3, tipLength=0.3)
+    cy  = img_h // 2
 
-    # --- Direction label (shows avoidance direction, opposite to obstacle) ---
-    if steer > 0.15:
-        dir_txt, dir_col = "RIGHT",    GREEN   # obstacle left → go right
-    elif steer < -0.15:
-        dir_txt, dir_col = "LEFT",     BLUE    # obstacle right → go left
+    # steer > 0 → obstacle left → go right → +x on screen
+    # pitch > 0 → obstacle above → go down → +y on screen
+    ARROW_SCALE = 100
+    dx = int( steer * ARROW_SCALE)
+    dy = int( pitch * ARROW_SCALE)
+
+    magnitude = (dx ** 2 + dy ** 2) ** 0.5
+    arrow_col = YELLOW if magnitude < 15 else (RED if coll > 0.5 else GREEN)
+
+    if magnitude > 5:
+        cv2.arrowedLine(canvas, (cx, cy), (cx + dx, cy + dy),
+                        arrow_col, 4, tipLength=0.35)
     else:
-        dir_txt, dir_col = "STRAIGHT", YELLOW
-    cv2.putText(canvas, dir_txt, (w - 120, gauge_y + 24),
+        # No significant motion needed — draw a small circle
+        cv2.circle(canvas, (cx, cy), 10, YELLOW, 2)
+
+    # Crosshair at centre
+    cv2.line(canvas, (cx - 15, cy), (cx + 15, cy), (80, 80, 80), 1)
+    cv2.line(canvas, (cx, cy - 15), (cx, cy + 15), (80, 80, 80), 1)
+
+    # -----------------------------------------------------------------------
+    # Direction label (bottom of image, above gauge)
+    # -----------------------------------------------------------------------
+    h_label = "RIGHT" if steer >  0.15 else ("LEFT"  if steer < -0.15 else "")
+    v_label = "DOWN"  if pitch >  0.10 else ("UP"    if pitch < -0.10 else "")
+    dir_txt = " + ".join(filter(None, [h_label, v_label])) or "STRAIGHT"
+    dir_col = YELLOW if dir_txt == "STRAIGHT" else arrow_col
+    cv2.putText(canvas, dir_txt, (w - 140, img_h - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, dir_col, 2)
 
-    cv2.putText(canvas, f"Steer: {steer:+.3f}",
-                (10, gauge_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.65, WHITE, 1)
+    # -----------------------------------------------------------------------
+    # Gauge panel
+    # -----------------------------------------------------------------------
+    cv2.putText(canvas, f"Steer: {steer:+.3f}  Pitch: {pitch:+.3f}",
+                (10, gauge_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)
 
-    # --- Collision bar (CNN output) ---
+    # --- Collision bar ---
     bar_x0, bar_y0 = 10, gauge_y + 42
     bar_w,  bar_h  = w - 20, 20
-    filled = int(bar_w * float(np.clip(coll, 0, 1)))
+    filled  = int(bar_w * float(np.clip(coll, 0, 1)))
     bar_col = RED if coll > 0.5 else GREEN
     cv2.rectangle(canvas, (bar_x0, bar_y0),
                   (bar_x0 + bar_w, bar_y0 + bar_h), (70, 70, 70), -1)
@@ -157,11 +180,11 @@ def draw_overlay(
 
     # --- Depth readout ---
     depth_str = f"Depth: {depth_mm/1000:.2f} m" if depth_mm > 0 else "Depth: --"
-    depth_col = RED if depth_mm < DEPTH_COLLISION_MM else WHITE
+    depth_col = RED if 0 < depth_mm < DEPTH_COLLISION_MM else WHITE
     cv2.putText(canvas, depth_str, (10, gauge_y + 90),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.60, depth_col, 1)
 
-    # --- CNN raw (before override) label ---
+    # --- CNN raw (before override) ---
     if depth_override:
         cv2.putText(canvas, f"CNN raw: {coll_raw:.3f}",
                     (10, gauge_y + 112),
@@ -171,7 +194,7 @@ def draw_overlay(
     cv2.putText(canvas, f"FPS: {fps:.1f}", (w - 100, gauge_y + 90),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)
 
-    # --- Depth override banner ---
+    # --- Obstacle banner ---
     if depth_override:
         cv2.rectangle(canvas, (0, 0), (w, 26), RED, -1)
         cv2.putText(canvas, "! OBSTACLE DETECTED (depth < 2 m) !",
@@ -277,6 +300,48 @@ def get_center_depth_mm(depth_frame: np.ndarray) -> float:
     return float(np.median(valid)) if valid.size > 0 else 0.0
 
 
+def get_vertical_bias(depth_frame: np.ndarray) -> float:
+    """
+    Estimate vertical avoidance direction from stereo depth.
+
+    Splits the central ROI into top and bottom halves and compares their
+    median depths. Returns a value in [-1, +1]:
+      +1 = top half much closer  → obstacle above → go DOWN
+      -1 = bottom half much closer → obstacle below → go UP
+       0 = symmetric / no clear vertical threat
+
+    Only returns a non-zero value when depth is valid and the asymmetry
+    exceeds a minimum threshold (avoids noise-driven corrections).
+    """
+    h, w = depth_frame.shape
+    roi_h = int(h * DEPTH_ROI_FRAC)
+    roi_w = int(w * DEPTH_ROI_FRAC)
+    y0 = (h - roi_h) // 2
+    x0 = (w - roi_w) // 2
+    roi = depth_frame[y0:y0 + roi_h, x0:x0 + roi_w]
+
+    mid = roi_h // 2
+    top_valid    = roi[:mid, :][roi[:mid, :] > 0]
+    bottom_valid = roi[mid:, :][roi[mid:, :] > 0]
+
+    if top_valid.size == 0 or bottom_valid.size == 0:
+        return 0.0
+
+    top_med    = float(np.median(top_valid))
+    bottom_med = float(np.median(bottom_valid))
+
+    # Normalise asymmetry: positive = top closer = go down
+    total = top_med + bottom_med
+    if total < 1.0:
+        return 0.0
+    bias = (bottom_med - top_med) / total   # [-1, +1]
+
+    # Suppress small noise (< 5 % asymmetry)
+    if abs(bias) < 0.05:
+        return 0.0
+    return float(np.clip(bias, -1.0, 1.0))
+
+
 # ---------------------------------------------------------------------------
 # Main run loop
 # ---------------------------------------------------------------------------
@@ -305,6 +370,7 @@ def run(blob_path: Path, use_depth: bool = True):
         fps_t0       = time.time()
         fps          = 0.0
         depth_mm     = 0.0
+        pitch        = 0.0   # vertical avoidance bias from depth top/bottom asymmetry
         canvas       = np.zeros((DISP_H, DISP_W, 3), dtype=np.uint8)
 
         while pipeline.isRunning():
@@ -312,10 +378,11 @@ def run(blob_path: Path, use_depth: bool = True):
             frame      = q_prev.tryGet()
             depth_data = q_depth.tryGet() if q_depth else None
 
-            # ---- Update depth measurement ----
+            # ---- Update depth measurements ----
             if depth_data is not None:
                 depth_frame = depth_data.getCvFrame()   # uint16 mm
                 depth_mm    = get_center_depth_mm(depth_frame)
+                pitch       = get_vertical_bias(depth_frame)
 
             # ---- Update camera display ----
             if frame is not None:
@@ -338,8 +405,8 @@ def run(blob_path: Path, use_depth: bool = True):
                     steer_raw = float(t.flat[0])
                     coll_raw  = float(t.flat[1])
 
-                steer = float(np.clip(steer_raw, -1.0, 1.0))
-                coll_raw = float(np.clip(coll_raw, 0.0, 1.0))
+                steer    = float(np.clip(steer_raw, -1.0, 1.0))
+                coll_raw = float(np.clip(coll_raw,  0.0, 1.0))
 
                 # Depth safety override: obstacle within 2 m → force coll=1
                 depth_override = (
@@ -357,11 +424,11 @@ def run(blob_path: Path, use_depth: bool = True):
                     fps_t0       = time.time()
 
                 draw_overlay(
-                    canvas, steer, coll, coll_raw, depth_mm, fps, depth_override
+                    canvas, steer, pitch, coll, coll_raw, depth_mm, fps, depth_override
                 )
                 print(
-                    f"\rsteer={steer:+.4f}  coll={coll:.4f}"
-                    f"  depth={depth_mm/1000:.2f}m  fps={fps:.1f}   ",
+                    f"\rsteer={steer:+.4f}  pitch={pitch:+.4f}"
+                    f"  coll={coll:.4f}  depth={depth_mm/1000:.2f}m  fps={fps:.1f}   ",
                     end="",
                     flush=True,
                 )
