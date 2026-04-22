@@ -39,12 +39,18 @@ def convert(onnx_path: Path, output_path: Path, shaves: int):
     print(f"SHAVE cores : {shaves}  (OAK-D Lite has 6 available)")
     print("Uploading to Luxonis blob compiler (requires internet)...")
 
+    # The ONNX model takes float32 [0,1] input. We tell Model Optimizer to
+    # apply scale_values=255 (divide uint8 by 255) for the 1-channel input so
+    # the VPU can receive raw GRAY8 from ImageManip. No mean subtraction.
     blob_path = blobconverter.from_onnx(
         model=str(onnx_path),
         data_type="FP16",
         shaves=shaves,
         use_cache=False,
         output_dir=str(output_path.parent),
+        optimizer_params=[
+            "--scale_values=input[255]",
+        ],
     )
 
     # blobconverter names the file after the model; rename to our target name

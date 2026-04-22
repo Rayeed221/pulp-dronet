@@ -62,12 +62,14 @@ DEFAULT_BLOB = SCRIPT_DIR / "dronet_tiny.blob"
 # ---------------------------------------------------------------------------
 # Preprocessing constants (match training CenterCrop(200) from 324×244 Himax)
 # ---------------------------------------------------------------------------
-# Fraction of Himax frame used by the 200×200 centre crop:
-#   horiz = 200/324 = 0.6173,  vert = 200/244 = 0.8197
-# Applied to mono native resolution 1280×800:
-MONO_W, MONO_H       = 1280, 800
-CROP_X0, CROP_Y0     = 245, 72
-CROP_X1, CROP_Y1     = 1035, 728   # 790×656 crop → resize → 200×200
+# OAK-D Lite OV9282 mono cameras only support GRAY8 output in binned 640×400
+# mode (not 1280×800). We use 640×400 and halve the crop coordinates:
+#   Fraction from Himax 324×244:  horiz=200/324=0.6173, vert=200/244=0.8197
+#   Applied to 1280×800: x0=245,y0=72, x1=1035,y1=728 → 790×656
+#   Halved for 640×400:  x0=122,y0=36, x1=517,y1=364  → 395×328 → 200×200
+MONO_W, MONO_H       = 640, 400
+CROP_X0, CROP_Y0     = 122, 36
+CROP_X1, CROP_Y1     = 517, 364   # 395×328 crop → resize → 200×200
 MODEL_INPUT_SIZE     = 200
 
 # Collision threshold matching training label definition (2 m = 2000 mm)
@@ -111,17 +113,20 @@ def draw_overlay(
     cv2.rectangle(canvas, (0, gauge_y), (w, h), (30, 30, 30), -1)
 
     # --- Steering arrow ---
+    # Model convention: steer > 0 = turn left, steer < 0 = turn right.
+    # The arrow shows where the drone should GO (away from obstacle), so we
+    # negate steer so the arrowhead points in the correct avoidance direction.
     cx  = w // 2
     cy  = img_h - 20
-    end_x = int(cx - steer * 90)
+    end_x = int(cx + steer * 90)   # negated: positive steer → arrow points right (away from left obstacle)
     arrow_col = YELLOW if abs(steer) < 0.15 else (GREEN if steer > 0 else BLUE)
     cv2.arrowedLine(canvas, (cx, cy), (end_x, cy), arrow_col, 3, tipLength=0.3)
 
-    # --- Direction label ---
+    # --- Direction label (shows avoidance direction, opposite to obstacle) ---
     if steer > 0.15:
-        dir_txt, dir_col = "LEFT",     GREEN
+        dir_txt, dir_col = "RIGHT",    GREEN   # obstacle left → go right
     elif steer < -0.15:
-        dir_txt, dir_col = "RIGHT",    BLUE
+        dir_txt, dir_col = "LEFT",     BLUE    # obstacle right → go left
     else:
         dir_txt, dir_col = "STRAIGHT", YELLOW
     cv2.putText(canvas, dir_txt, (w - 120, gauge_y + 24),
@@ -179,95 +184,82 @@ def draw_overlay(
 
 def build_pipeline(blob_path: Path, use_depth: bool = True):
     """
-    Build depthai v3 Pipeline.
+    Build depthai v3 Pipeline and return (pipeline, q_nn, q_prev, q_depth).
 
-    LEFT mono camera → crop+resize to 200×200 → NeuralNetwork
-    LEFT + RIGHT mono → StereoDepth               (if use_depth=True)
+    LEFT mono camera (CAM_B) → ImageManip crop+resize 200×200 → NeuralNetwork
+    LEFT + RIGHT mono (CAM_C) → StereoDepth             (if use_depth=True)
+
+    Uses v3 API: Camera.build(socket), createOutputQueue(), with pipeline context.
     """
     import depthai as dai
 
     pipeline = dai.Pipeline()
 
     # ------------------------------------------------------------------
-    # LEFT mono camera  (OV9282, native grayscale — closest to Himax)
+    # LEFT mono camera  (CAM_B = OV9282, native grayscale)
     # ------------------------------------------------------------------
-    left_cam = pipeline.create(dai.node.Camera)
-    left_cam.setBoardSocket(dai.CameraBoardSocket.LEFT)
-    # Request full native resolution for accurate crop geometry
+    left_cam = pipeline.create(dai.node.Camera).build(
+        dai.CameraBoardSocket.CAM_B
+    )
     left_out = left_cam.requestOutput(
         (MONO_W, MONO_H), type=dai.ImgFrame.Type.GRAY8
     )
 
     # ------------------------------------------------------------------
     # ImageManip: centre-crop 790×656 then resize to 200×200
-    # Matches training: CenterCrop(200) from 324×244 Himax QVGA image
+    # v3 API: addCrop(x, y, w, h) + setOutputSize(w, h)
     # ------------------------------------------------------------------
+    CROP_W = CROP_X1 - CROP_X0   # 790
+    CROP_H = CROP_Y1 - CROP_Y0   # 656
     manip = pipeline.create(dai.node.ImageManip)
-    manip.initialConfig.setCropAbsolute(CROP_X0, CROP_Y0, CROP_X1, CROP_Y1)
-    manip.initialConfig.setResize(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE)
+    manip.initialConfig.addCrop(CROP_X0, CROP_Y0, CROP_W, CROP_H)
+    manip.initialConfig.setOutputSize(MODEL_INPUT_SIZE, MODEL_INPUT_SIZE)
     manip.initialConfig.setFrameType(dai.ImgFrame.Type.GRAY8)
     manip.setMaxOutputFrameSize(MODEL_INPUT_SIZE * MODEL_INPUT_SIZE)
     left_out.link(manip.inputImage)
 
     # ------------------------------------------------------------------
     # NeuralNetwork: DroNet on MyriadX VPU
-    # Input:  (1, 1, 200, 200) uint8 — norm /255 is baked into the blob
-    # Output: steer (fp16 scalar), coll (fp16 scalar)
+    # blob input: (1,1,200,200) — scale_values=255 applied by VPU
     # ------------------------------------------------------------------
     nn = pipeline.create(dai.node.NeuralNetwork)
     nn.setBlobPath(blob_path)
     nn.setNumInferenceThreads(2)
     nn.input.setBlocking(False)
-    nn.input.setQueueSize(1)
+    nn.input.setMaxSize(1)
     manip.out.link(nn.input)
 
     # ------------------------------------------------------------------
-    # StereoDepth: uses LEFT + RIGHT mono cameras
-    # Provides frontal depth to mirror the VL53L1x ToF sensor used for
-    # generating collision labels during training.
+    # StereoDepth: CAM_B (left) + CAM_C (right)
     # ------------------------------------------------------------------
+    q_depth = None
     if use_depth:
-        right_cam = pipeline.create(dai.node.Camera)
-        right_cam.setBoardSocket(dai.CameraBoardSocket.RIGHT)
+        right_cam = pipeline.create(dai.node.Camera).build(
+            dai.CameraBoardSocket.CAM_C
+        )
         right_out = right_cam.requestOutput(
             (MONO_W, MONO_H), type=dai.ImgFrame.Type.GRAY8
         )
 
         stereo = pipeline.create(dai.node.StereoDepth)
         stereo.setDefaultProfilePreset(
-            dai.node.StereoDepth.PresetType.HIGH_DENSITY
+            dai.node.StereoDepth.PresetMode.DENSITY
         )
-        stereo.setDepthAlign(dai.CameraBoardSocket.LEFT)
+        stereo.setDepthAlign(dai.CameraBoardSocket.CAM_B)
         stereo.setOutputSize(MONO_W, MONO_H)
 
         left_out.link(stereo.left)
         right_out.link(stereo.right)
 
-        xout_depth = pipeline.create(dai.node.XLinkOut)
-        xout_depth.setStreamName("depth")
-        xout_depth.input.setBlocking(False)
-        xout_depth.input.setQueueSize(1)
-        stereo.depth.link(xout_depth.input)
+        q_depth = stereo.depth.createOutputQueue(maxSize=4, blocking=False)
 
     # ------------------------------------------------------------------
-    # XLinkOut: NN results
+    # Output queues (v3: createOutputQueue replaces XLinkOut)
     # ------------------------------------------------------------------
-    xout_nn = pipeline.create(dai.node.XLinkOut)
-    xout_nn.setStreamName("nn")
-    xout_nn.input.setBlocking(False)
-    xout_nn.input.setQueueSize(1)
-    nn.out.link(xout_nn.input)
+    q_nn   = nn.out.createOutputQueue(maxSize=4, blocking=False)
+    q_prev = manip.out.createOutputQueue(maxSize=4, blocking=False)
 
-    # ------------------------------------------------------------------
-    # XLinkOut: preprocessed camera frame (200×200) for display
-    # ------------------------------------------------------------------
-    xout_prev = pipeline.create(dai.node.XLinkOut)
-    xout_prev.setStreamName("preview")
-    xout_prev.input.setBlocking(False)
-    xout_prev.input.setQueueSize(1)
-    manip.out.link(xout_prev.input)
-
-    return pipeline
+    return pipeline, q_nn, q_prev, q_depth
 
 
 def get_center_depth_mm(depth_frame: np.ndarray) -> float:
@@ -302,28 +294,20 @@ def run(blob_path: Path, use_depth: bool = True):
     print(f"Blob        : {blob_path}")
     print(f"Depth layer : {'enabled' if use_depth else 'disabled'}")
     print("Building pipeline...")
-    pipeline = build_pipeline(blob_path, use_depth=use_depth)
+    pipeline, q_nn, q_prev, q_depth = build_pipeline(blob_path, use_depth=use_depth)
 
     print("Connecting to OAK-D Lite...")
-    with dai.Device(pipeline) as device:
-        print(f"Device      : {device.getDeviceName()}")
-        print(f"USB speed   : {device.getUsbSpeed().name}")
-        print("Press 'q' or ESC to quit.\n")
+    pipeline.start()
+    print("Connected. Press 'q' or ESC to quit.\n")
 
-        q_nn    = device.getOutputQueue("nn",      maxSize=4, blocking=False)
-        q_prev  = device.getOutputQueue("preview", maxSize=4, blocking=False)
-        q_depth = (
-            device.getOutputQueue("depth", maxSize=4, blocking=False)
-            if use_depth else None
-        )
-
+    try:
         fps_counter  = 0
         fps_t0       = time.time()
         fps          = 0.0
         depth_mm     = 0.0
         canvas       = np.zeros((DISP_H, DISP_W, 3), dtype=np.uint8)
 
-        while True:
+        while pipeline.isRunning():
             nn_data    = q_nn.tryGet()
             frame      = q_prev.tryGet()
             depth_data = q_depth.tryGet() if q_depth else None
@@ -347,19 +331,17 @@ def run(blob_path: Path, use_depth: bool = True):
             # ---- Process NN output ----
             if nn_data is not None:
                 try:
-                    steer_raw = nn_data.getLayerFp16("steer")[0]
-                    coll_raw  = nn_data.getLayerFp16("coll")[0]
+                    steer_raw = float(nn_data.getTensor("steer").flat[0])
+                    coll_raw  = float(nn_data.getTensor("coll").flat[0])
                 except Exception:
-                    raw       = nn_data.getFirstLayerFp16()
-                    steer_raw = float(raw[0])
-                    coll_raw  = float(raw[1])
+                    t         = nn_data.getFirstTensor()
+                    steer_raw = float(t.flat[0])
+                    coll_raw  = float(t.flat[1])
 
                 steer = float(np.clip(steer_raw, -1.0, 1.0))
                 coll_raw = float(np.clip(coll_raw, 0.0, 1.0))
 
-                # Depth safety override: if stereo depth detects an obstacle
-                # within 2 m, force collision = 1.0 (mirrors training label logic
-                # which used the VL53L1x ToF sensor with a 2 m threshold).
+                # Depth safety override: obstacle within 2 m → force coll=1
                 depth_override = (
                     use_depth
                     and depth_mm > 0
@@ -390,6 +372,8 @@ def run(blob_path: Path, use_depth: bool = True):
                 print()
                 break
 
+    finally:
+        pipeline.stop()
     cv2.destroyAllWindows()
 
 

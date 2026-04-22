@@ -17,9 +17,9 @@ The full ResBlock model (bypass=True) uses nemo.quant.pact.PACT_IntegerAdd,
 a custom PyTorch op that cannot be cleanly exported to ONNX. Use the tiny
 model for OAK-D Lite deployment.
 
-Normalization is baked into the exported model via a wrapper so ImageManip
-on the OAK-D Lite can pass raw GRAY8 uint8 [0-255] frames directly — no
-host-side preprocessing needed.
+Input: float32 (1, 1, 200, 200) in [0, 1]. The /255 normalization is applied
+by OpenVINO Model Optimizer during blob compilation (scale_values=255) so the
+VPU can receive raw GRAY8 uint8 frames directly from ImageManip.
 """
 
 import sys
@@ -42,25 +42,6 @@ from model.dronet_v3 import dronet, Depthwise_Separable
 WEIGHTS_PATH = DRONET_ROOT / "model" / "tiny-pulp-dronet-v3-dw-pw-0.125.pth"
 OUTPUT_ONNX  = SCRIPT_DIR / "dronet_tiny.onnx"
 
-# ---------------------------------------------------------------------------
-# Model wrapper: bakes uint8→float32 normalization into the ONNX graph
-# ---------------------------------------------------------------------------
-class DronetWithNorm(nn.Module):
-    """
-    Wraps DroNet with input normalization so the MyriadX VPU receives raw
-    GRAY8 uint8 pixels and the /255 division happens inside the model graph.
-    """
-    def __init__(self, net: nn.Module):
-        super().__init__()
-        self.net = net
-
-    def forward(self, x: torch.Tensor):
-        # x: (1, 1, 200, 200) uint8 cast to float32
-        x = x.float() / 255.0
-        steer, coll = self.net(x)
-        return steer, coll
-
-
 def load_model(weights_path: Path, device: torch.device) -> nn.Module:
     net = dronet(depth_mult=0.125, block_class=Depthwise_Separable, bypass=False)
 
@@ -82,14 +63,15 @@ def export(weights_path: Path = WEIGHTS_PATH, output_path: Path = OUTPUT_ONNX):
     print(f"Output  : {output_path}")
 
     device = torch.device("cpu")
-    net = load_model(weights_path, device)
-    model = DronetWithNorm(net).to(device)
+    model = load_model(weights_path, device)
     model.eval()
 
-    # Dummy uint8 input matching OAK-D Lite ImageManip output
-    dummy = torch.zeros(1, 1, 200, 200, dtype=torch.uint8)
+    # Float32 input — normalization (/255) is handled by OpenVINO Model
+    # Optimizer (scale_values=255) during blob compilation, so the VPU
+    # receives raw uint8 from ImageManip and scales internally.
+    dummy = torch.zeros(1, 1, 200, 200, dtype=torch.float32)
 
-    print("Exporting to ONNX (opset 12)...")
+    print("Exporting to ONNX (opset 12, legacy TorchScript exporter)...")
     torch.onnx.export(
         model,
         dummy,
@@ -99,6 +81,7 @@ def export(weights_path: Path = WEIGHTS_PATH, output_path: Path = OUTPUT_ONNX):
         opset_version=12,
         do_constant_folding=True,
         dynamic_axes=None,  # fixed batch size 1 for MyriadX
+        dynamo=False,       # use legacy exporter: opset 12, single file, no onnxscript
     )
     print(f"Saved: {output_path}")
 
@@ -111,7 +94,8 @@ def export(weights_path: Path = WEIGHTS_PATH, output_path: Path = OUTPUT_ONNX):
 
         sess = ort.InferenceSession(str(output_path),
                                     providers=["CPUExecutionProvider"])
-        dummy_np = np.zeros((1, 1, 200, 200), dtype=np.uint8)
+        # Simulate normalized float32 input (as VPU will see after /255)
+        dummy_np = np.zeros((1, 1, 200, 200), dtype=np.float32)
         steer_out, coll_out = sess.run(None, {"input": dummy_np})
         print(f"OnnxRuntime check OK  steer={steer_out[0]:.4f}  coll={coll_out[0]:.4f}")
     except ImportError:
