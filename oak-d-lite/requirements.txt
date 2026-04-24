@@ -1,0 +1,23 @@
+# PULP-DroNet v3 → OAK-D Lite deployment dependencies
+#
+# OpenVINO must be installed separately from the Intel distribution;
+# it provides the 'mo' CLI used by convert_to_openvino.sh.
+# Download: https://docs.openvino.ai/latest/openvino_docs_install_guides.html
+
+# Core ML
+torch>=1.13
+torchvision>=0.14
+
+# ONNX export and verification
+onnx>=1.13
+onnxruntime>=1.14
+
+# DepthAI inference on OAK-D Lite
+depthai>=2.21
+
+# Blob conversion (IR → .blob for Myriad X)
+blobconverter>=1.4
+
+# Utilities
+numpy
+opencv-python
