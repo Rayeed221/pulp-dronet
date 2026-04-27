@@ -83,7 +83,7 @@ def main():
     parser.add_argument(
         "--shaves",
         type=int,
-        default=6,
+        default=5,
         help="Number of SHAVE cores to use (default: 6, OAK-D Lite maximum)",
     )
     args = parser.parse_args()

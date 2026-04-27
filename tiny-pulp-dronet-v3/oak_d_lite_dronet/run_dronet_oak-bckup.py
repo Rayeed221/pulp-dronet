@@ -45,7 +45,7 @@ collision = 1.0, regardless of what the CNN outputs. This is a hard
 safety guarantee on top of the learned model.
 
 Model outputs:
-    steer : yaw-rate in [-1, +1]  (positive = go right, negative = go left)
+    steer : yaw-rate in [-1, +1]  (positive = left, negative = right)
     coll  : collision probability in [0, 1]
 """
 
@@ -56,15 +56,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-try:
-    from pymavlink import mavutil
-    _MAVLINK_AVAILABLE = True
-except ImportError:
-    _MAVLINK_AVAILABLE = False
-
 SCRIPT_DIR   = Path(__file__).resolve().parent
-# DEFAULT_BLOB = SCRIPT_DIR / "dronet_tiny.blob"
-DEFAULT_BLOB = SCRIPT_DIR / "dronet_tiny_openvino_2022.1_5shave.blob"
+DEFAULT_BLOB = SCRIPT_DIR / "dronet_tiny.blob"
 
 # ---------------------------------------------------------------------------
 # Preprocessing constants (match training CenterCrop(200) from 324×244 Himax)
@@ -82,7 +75,7 @@ MODEL_INPUT_SIZE     = 200
 # Collision threshold matching training label definition (2 m = 2000 mm)
 DEPTH_COLLISION_MM   = 2000
 # Central ROI of the depth map used for obstacle distance (fraction of w/h)
-DEPTH_ROI_FRAC       = 0.15
+DEPTH_ROI_FRAC       = 0.25
 
 # ---------------------------------------------------------------------------
 # Display constants
@@ -108,7 +101,6 @@ def draw_overlay(
     canvas: np.ndarray,
     steer: float,
     lateral: float,
-    vertical: float,
     coll: float,
     coll_raw: float,
     depth_mm: float,
@@ -122,28 +114,23 @@ def draw_overlay(
     cv2.rectangle(canvas, (0, gauge_y), (w, h), (30, 30, 30), -1)
 
     # -----------------------------------------------------------------------
-    # 2D avoidance arrow drawn on the camera image
-    # steer   : yaw from model  (+1 = go right,  -1 = go left)
-    # lateral : depth left/right asymmetry  (+1 = go right, -1 = go left)
-    # vertical: depth top/bottom asymmetry  (+1 = go down,  -1 = go up)
-    # Arrow tip shows the combined avoidance direction from drone's perspective.
-    # In OpenCV image coordinates: +x = right, +y = down.
-    # vertical > 0 means go down in the real world → arrow tip moves DOWN (+y).
+    # Horizontal avoidance arrow drawn on the camera image
+    # steer : yaw from model  (+1 = left obstacle → go right)
+    # lateral : depth left/right asymmetry  (+1 = left obstacle → go right)
+    # Arrow is horizontal only — model has no trained vertical output.
     # -----------------------------------------------------------------------
     cx  = w // 2
     cy  = img_h // 2
 
     ARROW_SCALE = 100
     dx_raw = (steer + lateral) * 0.5   # average two horizontal sources → [-1, +1]
-    dy_raw = vertical                   # depth vertical bias → [-1, +1]
-    dx = int(dx_raw * ARROW_SCALE)
-    dy = int(dy_raw * ARROW_SCALE)     # +dy = down on screen = go down in world
+    dx     = int(dx_raw * ARROW_SCALE)
 
-    magnitude = int((dx**2 + dy**2) ** 0.5)
+    magnitude = abs(dx)
     arrow_col = YELLOW if magnitude < 15 else (RED if coll > 0.5 else GREEN)
 
     if magnitude > 5:
-        cv2.arrowedLine(canvas, (cx, cy), (cx + dx, cy + dy),
+        cv2.arrowedLine(canvas, (cx, cy), (cx + dx, cy),
                         arrow_col, 4, tipLength=0.35)
     else:
         cv2.circle(canvas, (cx, cy), 10, YELLOW, 2)
@@ -155,12 +142,7 @@ def draw_overlay(
     # -----------------------------------------------------------------------
     # Direction label (bottom of image, above gauge)
     # -----------------------------------------------------------------------
-    if abs(dx_raw) < 0.15 and abs(dy_raw) < 0.15:
-        dir_txt = "STRAIGHT"
-    elif abs(dy_raw) > abs(dx_raw):
-        dir_txt = "DOWN" if dy_raw > 0 else "UP"
-    else:
-        dir_txt = "RIGHT" if dx_raw > 0 else "LEFT"
+    dir_txt = "RIGHT" if dx_raw > 0.15 else ("LEFT" if dx_raw < -0.15 else "STRAIGHT")
     dir_col = YELLOW if dir_txt == "STRAIGHT" else arrow_col
     cv2.putText(canvas, dir_txt, (w - 140, img_h - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.65, dir_col, 2)
@@ -168,9 +150,8 @@ def draw_overlay(
     # -----------------------------------------------------------------------
     # Gauge panel
     # -----------------------------------------------------------------------
-    cv2.putText(canvas,
-                f"Steer: {steer:+.3f}  Lat: {lateral:+.3f}  Vert: {vertical:+.3f}",
-                (10, gauge_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.48, WHITE, 1)
+    cv2.putText(canvas, f"Steer: {steer:+.3f}  Lateral: {lateral:+.3f}",
+                (10, gauge_y + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 1)
 
     # --- Collision bar ---
     bar_x0, bar_y0 = 10, gauge_y + 42
@@ -213,138 +194,6 @@ def draw_overlay(
         cv2.rectangle(canvas, (0, 0), (w, 26), RED, -1)
         cv2.putText(canvas, "! OBSTACLE DETECTED (depth < 2 m) !",
                     (6, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.55, WHITE, 2)
-
-
-# ---------------------------------------------------------------------------
-# MAVLink bridge
-# ---------------------------------------------------------------------------
-
-class MavlinkBridge:
-    """
-    Sends DroNet outputs to a flight controller via MAVLink TCP.
-
-    DroNet was designed for a vehicle that moves forward continuously while
-    yawing to steer. To replicate this on a multirotor we send
-    SET_POSITION_TARGET_LOCAL_NED (msg #84) in MAV_FRAME_BODY_NED so the
-    drone moves forward at a fixed speed while yaw rate is set from steer.
-
-    type_mask = 0x03C7  → use vx, vy, vz and yaw_rate; ignore everything else
-      vx        = FORWARD_SPEED (m/s) — constant cruise, zeroed on collision
-      vy        = 0   (no lateral/strafe — model not trained for it)
-      vz        = 0   (altitude hold)
-      yaw_rate  = steer × MAX_YAW_RATE_RAD  (rad/s)
-
-    On collision (coll > COLL_THRESH): all velocities and yaw rate set to 0.
-
-    Requires the FC to be in GUIDED mode before commands take effect.
-    Default URL: tcp:127.0.0.1:5760  (ArduPilot SITL default)
-                 tcp:127.0.0.1:5762  (MAVProxy secondary output)
-    """
-
-    HB_INTERVAL       = 1.0   # heartbeat period (s)
-    COLL_THRESH       = 0.3
-    FORWARD_SPEED     = 0.5   # m/s cruise speed when no collision (body x = forward)
-    MAX_YAW_RATE_RAD  = 0.8   # rad/s at full steer deflection (~45 °/s)
-    MAX_LATERAL_SPEED = 0.3   # m/s at full lateral bias (body y = right)
-    MAX_VERTICAL_SPEED = 0.2  # m/s at full vertical bias (body/NED z = down)
-
-    # type_mask: ignore pos(0-2), use vel(3-5), ignore accel(6-8),
-    #            ignore yaw(9), use yaw_rate(10)  →  bits 0,1,2,6,7,8,9 = 0x1C7 | 0x200 = 0x3C7
-    _TYPE_MASK = (
-        mavutil.mavlink.POSITION_TARGET_TYPEMASK_X_IGNORE
-        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_Y_IGNORE
-        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_Z_IGNORE
-        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AX_IGNORE
-        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AY_IGNORE
-        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_AZ_IGNORE
-        | mavutil.mavlink.POSITION_TARGET_TYPEMASK_YAW_IGNORE
-    ) if _MAVLINK_AVAILABLE else 0x3C7
-
-    def __init__(self, url: str = "tcp:127.0.0.1:5763"):
-        self._url     = url
-        self._conn    = None
-        self._last_hb = 0.0
-
-    def connect(self) -> bool:
-        if not _MAVLINK_AVAILABLE:
-            print("WARNING: pymavlink not installed — MAVLink disabled. "
-                  "Run: pip install pymavlink")
-            return False
-        try:
-            print(f"MAVLink     : connecting to {self._url} ...")
-            self._conn = mavutil.mavlink_connection(
-                self._url,
-                source_system=255,
-                source_component=0,
-            )
-            hb = self._conn.wait_heartbeat(timeout=5)
-            if hb is None:
-                print("MAVLink     : no heartbeat received — continuing without FC")
-                self._conn = None
-                return False
-            print(f"MAVLink     : heartbeat from system {self._conn.target_system} "
-                  f"component {self._conn.target_component}")
-            print("MAVLink     : set FC to GUIDED mode before arming")
-            return True
-        except Exception as exc:
-            print(f"MAVLink     : connection failed ({exc}) — inference will still run")
-            self._conn = None
-            return False
-
-    def send(self, steer: float, coll: float,
-             lateral: float = 0.0, vertical: float = 0.0) -> None:
-        """
-        Send SET_POSITION_TARGET_LOCAL_NED in MAV_FRAME_BODY_NED.
-
-        Body-frame mapping from model/depth outputs (drone perspective):
-          vx        = FORWARD_SPEED (constant cruise; 0 on collision)
-          vy        = lateral * MAX_LATERAL_SPEED
-                      lateral > 0 → obstacle left  → avoid right → vy > 0 (body right)
-          vz        = vertical * MAX_VERTICAL_SPEED
-                      vertical > 0 → obstacle above → avoid down  → vz > 0 (NED down)
-          yaw_rate  = steer * MAX_YAW_RATE_RAD
-                      steer > 0 → go right → positive yaw (clockwise in NED)
-        All outputs zeroed when coll > COLL_THRESH.
-        """
-        if self._conn is None:
-            return
-
-        now = time.time()
-
-        # Periodic heartbeat — FC drops GCS link if it stops receiving these
-        if now - self._last_hb >= self.HB_INTERVAL:
-            self._conn.mav.heartbeat_send(
-                mavutil.mavlink.MAV_TYPE_GCS,
-                mavutil.mavlink.MAV_AUTOPILOT_INVALID,
-                0, 0, 0,
-            )
-            self._last_hb = now
-
-        if coll > self.COLL_THRESH:
-            vx = vy = vz = yaw_rate = 0.0
-        else:
-            vx       = self.FORWARD_SPEED
-            vy       = float(np.clip(lateral,  -1.0, 1.0)) * self.MAX_LATERAL_SPEED
-            vz       = float(np.clip(vertical, -1.0, 1.0)) * self.MAX_VERTICAL_SPEED
-            yaw_rate = float(np.clip(steer,    -1.0, 1.0)) * self.MAX_YAW_RATE_RAD
-
-        self._conn.mav.set_position_target_local_ned_send(
-            int((now % 1e6) * 1000),             # time_boot_ms (wrapping is fine)
-            self._conn.target_system,
-            self._conn.target_component,
-            mavutil.mavlink.MAV_FRAME_BODY_NED,  # body frame: x=fwd, y=right, z=down
-            self._TYPE_MASK,
-            0, 0, 0,        # x, y, z position (ignored)
-            vx, vy, vz,     # vx (forward), vy (right strafe), vz (down)
-            0, 0, 0,        # ax, ay, az (ignored)
-            0.0,            # yaw angle (ignored)
-            yaw_rate,       # yaw_rate (rad/s, positive = clockwise = nose right)
-        )
-
-    def close(self) -> None:
-        if self._conn is not None:
-            self._conn.close()
-            self._conn = None
 
 
 # ---------------------------------------------------------------------------
@@ -523,7 +372,7 @@ def get_vertical_bias(depth_frame: np.ndarray) -> float:
     bias = (bottom_med - top_med) / total   # [-1, +1]
 
     # Suppress small noise (< 5 % asymmetry)
-    if abs(bias) < 0.08:
+    if abs(bias) < 0.05:
         return 0.0
     return float(np.clip(bias, -1.0, 1.0))
 
@@ -532,7 +381,7 @@ def get_vertical_bias(depth_frame: np.ndarray) -> float:
 # Main run loop
 # ---------------------------------------------------------------------------
 
-def run(blob_path: Path, use_depth: bool = True, mav: "MavlinkBridge | None" = None):
+def run(blob_path: Path, use_depth: bool = True):
     import depthai as dai
 
     if not blob_path.exists():
@@ -544,7 +393,6 @@ def run(blob_path: Path, use_depth: bool = True, mav: "MavlinkBridge | None" = N
 
     print(f"Blob        : {blob_path}")
     print(f"Depth layer : {'enabled' if use_depth else 'disabled'}")
-    print(f"MAVLink     : {'enabled' if mav else 'disabled'}")
     print("Building pipeline...")
     pipeline, q_nn, q_prev, q_depth = build_pipeline(blob_path, use_depth=use_depth)
 
@@ -557,8 +405,7 @@ def run(blob_path: Path, use_depth: bool = True, mav: "MavlinkBridge | None" = N
         fps_t0       = time.time()
         fps          = 0.0
         depth_mm     = 0.0
-        lateral      = 0.0   # horizontal avoidance bias (+1 = go right)
-        vertical     = 0.0   # vertical avoidance bias  (+1 = go down)
+        lateral      = 0.0   # horizontal avoidance bias from depth left/right asymmetry
         canvas       = np.zeros((DISP_H, DISP_W, 3), dtype=np.uint8)
 
         while pipeline.isRunning():
@@ -571,7 +418,6 @@ def run(blob_path: Path, use_depth: bool = True, mav: "MavlinkBridge | None" = N
                 depth_frame = depth_data.getCvFrame()   # uint16 mm
                 depth_mm    = get_center_depth_mm(depth_frame)
                 lateral     = get_horizontal_bias(depth_frame)
-                vertical    = get_vertical_bias(depth_frame)
 
             # ---- Update camera display ----
             if frame is not None:
@@ -614,16 +460,12 @@ def run(blob_path: Path, use_depth: bool = True, mav: "MavlinkBridge | None" = N
                     fps_counter  = 0
                     fps_t0       = time.time()
 
-                if mav:
-                    mav.send(steer, coll, lateral=lateral, vertical=vertical)
-
                 draw_overlay(
-                    canvas, steer, lateral, vertical, coll, coll_raw, depth_mm, fps, depth_override
+                    canvas, steer, lateral, coll, coll_raw, depth_mm, fps, depth_override
                 )
-                mav_tag = "  [MAV TX]" if mav else ""
                 print(
                     f"\rsteer={steer:+.4f}  lateral={lateral:+.4f}"
-                    f"  coll={coll:.4f}  depth={depth_mm/1000:.2f}m  fps={fps:.1f}{mav_tag}   ",
+                    f"  coll={coll:.4f}  depth={depth_mm/1000:.2f}m  fps={fps:.1f}   ",
                     end="",
                     flush=True,
                 )
@@ -636,8 +478,6 @@ def run(blob_path: Path, use_depth: bool = True, mav: "MavlinkBridge | None" = N
 
     finally:
         pipeline.stop()
-        if mav:
-            mav.close()
     cv2.destroyAllWindows()
 
 
@@ -660,40 +500,8 @@ def main():
         action="store_true",
         help="Disable stereo depth safety layer (CNN-only mode)",
     )
-    parser.add_argument(
-        "--mavlink",
-        action="store_true",
-        help="Enable MAVLink output (requires pymavlink)",
-    )
-    parser.add_argument(
-        "--mavlink-url",
-        default="tcp:127.0.0.1:5763",
-        help="MAVLink connection URL (default: tcp:127.0.0.1:5763)",
-    )
-    parser.add_argument(
-        "--forward-speed",
-        type=float,
-        default=MavlinkBridge.FORWARD_SPEED,
-        help="Cruise forward speed in m/s when no collision (default: "
-             f"{MavlinkBridge.FORWARD_SPEED})",
-    )
-    parser.add_argument(
-        "--max-yaw-rate",
-        type=float,
-        default=MavlinkBridge.MAX_YAW_RATE_RAD,
-        help="Yaw rate at full steer deflection in rad/s (default: "
-             f"{MavlinkBridge.MAX_YAW_RATE_RAD})",
-    )
     args = parser.parse_args()
-
-    mav = None
-    if args.mavlink:
-        mav = MavlinkBridge(url=args.mavlink_url)
-        mav.FORWARD_SPEED    = args.forward_speed
-        mav.MAX_YAW_RATE_RAD = args.max_yaw_rate
-        mav.connect()   # non-fatal — inference runs even if FC unreachable
-
-    run(args.blob, use_depth=not args.no_depth, mav=mav)
+    run(args.blob, use_depth=not args.no_depth)
 
 
 if __name__ == "__main__":
